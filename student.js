@@ -132,7 +132,14 @@ function rebuildBookings() {
     bookings = Object.values(monthCache).flat();
 }
 
-async function loadMonth(key) {
+const inflight = {};
+
+function loadMonth(key) {
+    // never request the same month twice at the same time
+    return inflight[key] ||= fetchMonth(key).finally(() => { delete inflight[key]; });
+}
+
+async function fetchMonth(key) {
     const {from, to} = monthRange(key);
     const data = await callApi("publicSchedule", {from, to});
 
@@ -140,7 +147,11 @@ async function loadMonth(key) {
         throw new Error((data && data.message) || "The room schedule could not be loaded.");
     }
 
-    monthCache[key] = (data.reservations || []).map(r => ({
+    storeMonth(key, data.reservations);
+}
+
+function storeMonth(key, list) {
+    monthCache[key] = (list || []).map(r => ({
         RoomID: String(r.RoomID),
         Date: normDate(r.Date),
         Start: normTime(r.StartTime),
@@ -150,6 +161,45 @@ async function loadMonth(key) {
     })).filter(r => r.Start && r.End);
 
     rebuildBookings();
+    saveCache();
+}
+
+/* ---------- saved copy: the page shows instantly, then updates ---------- */
+
+const CACHE_KEY = "crStudentCache_v1";
+const CACHE_MAX_AGE = 6 * 60 * 60 * 1000;   // 6 hours
+let cachedAt = 0;
+
+function saveCache() {
+    try {
+        const keys = Object.keys(monthCache).sort().slice(-4);
+        const months = {};
+        keys.forEach(k => months[k] = monthCache[k]);
+        localStorage.setItem(CACHE_KEY, JSON.stringify({t: Date.now(), rooms, months}));
+    } catch (e) { /* storage full or blocked: ignore */ }
+}
+
+function loadCache() {
+    try {
+        const c = JSON.parse(localStorage.getItem(CACHE_KEY) || "null");
+        if (!c || !Array.isArray(c.rooms) || !c.rooms.length || Date.now() - c.t > CACHE_MAX_AGE) return false;
+        rooms = c.rooms;
+        Object.assign(monthCache, c.months || {});
+        rebuildBookings();
+        cachedAt = c.t;
+        return true;
+    } catch (e) { return false; }
+}
+
+/* quietly fetch the months next to the one on screen so arrows feel instant */
+function prefetchNeighbours() {
+    const run = () => {
+        [-1, 1].forEach(n => {
+            const key = monthKey(new Date(viewMonth.getFullYear(), viewMonth.getMonth() + n, 1));
+            if (!monthCache[key]) loadMonth(key).catch(() => {});
+        });
+    };
+    (window.requestIdleCallback || (f => setTimeout(f, 1500)))(run);
 }
 
 function showNotice(message) {
@@ -165,7 +215,31 @@ async function load(silent = false) {
     if (!silent) $("refreshBtn").classList.add("spin");
 
     try {
-        const roomData = await callApi("publicRooms");
+        // classrooms and the month schedule are requested at the same time
+        const keys = [...new Set([monthKey(viewMonth), selectedDate.slice(0, 7)])];
+        let roomData = null;
+
+        // ONE request for rooms + schedule (needs the updated Code.gs)
+        try {
+            const {from, to} = monthRange(keys[0]);
+            const all = await callApi("publicAll", {from, to});
+            if (all && all.success && Array.isArray(all.rooms)) {
+                roomData = all;
+                rooms = all.rooms;
+                storeMonth(keys[0], all.reservations);
+                await Promise.all(keys.slice(1).map(loadMonth));
+            }
+        } catch (e) {
+            if (e.name === "AbortError") throw e;
+        }
+
+        // older Code.gs, or publicAll failed: use the two separate requests
+        if (!roomData) {
+            [roomData] = await Promise.all([
+                callApi("publicRooms"),
+                ...keys.map(loadMonth)
+            ]);
+        }
 
         if (!roomData || !roomData.success) {
             throw new Error((roomData && roomData.message) || "The classrooms could not be loaded.");
@@ -175,18 +249,22 @@ async function load(silent = false) {
             .sort((a, b) => String(a.Building).localeCompare(String(b.Building)) ||
                             String(a.RoomName).localeCompare(String(b.RoomName), undefined, {numeric: true}));
 
-        // refresh the month on screen and the month of the chosen day
-        const keys = [...new Set([monthKey(viewMonth), selectedDate.slice(0, 7)])];
-        await Promise.all(keys.map(loadMonth));
-
+        saveCache();
+        cachedAt = 0;
         hideNotice();
         renderRoomSelect();
         renderAll();
         $("updatedAt").textContent = "Last updated " +
             new Date().toLocaleTimeString([], {hour: "numeric", minute: "2-digit"});
+        prefetchNeighbours();
 
     } catch (error) {
         console.warn("Student schedule error:", error.message);
+
+        if (cachedAt) {
+            $("updatedAt").textContent = "Showing saved schedule from " +
+                new Date(cachedAt).toLocaleTimeString([], {hour: "numeric", minute: "2-digit"}) + ". Could not update.";
+        }
 
         if (!silent || !rooms.length) {
             showNotice(error.name === "AbortError"
@@ -486,4 +564,10 @@ setInterval(() => { if (!document.hidden) load(true); }, REFRESH_MS);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) load(true); });
 window.addEventListener("online", () => load(true));
 
-load();
+/* show the saved copy straight away (if any), then fetch fresh data */
+if (loadCache()) {
+    renderRoomSelect();
+    renderAll();
+    $("updatedAt").textContent = "Showing saved schedule. Updating...";
+}
+load(true);

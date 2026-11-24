@@ -25,7 +25,7 @@ const HEADERS = {
     "ReservationID", "InstructorID", "InstructorName",
     "RoomID", "RoomName", "Date", "StartTime", "EndTime",
     "Students", "Subject", "Purpose", "Notes", "Status",
-    "CancellationReason", "CreatedAt", "CancelledAt", "InstructorView"
+    "CancellationReason", "CreatedAt", "CancelledAt", "InstructorView", "AdminView"
   ],
   Notifications: [
     "NotificationID", "Recipient", "Title", "Message",
@@ -323,6 +323,10 @@ function doPost(e) {
 
       case "setReservationView":
         result = setReservationView_(data);
+        break;
+
+      case "setAdminReservationView":
+        result = setAdminReservationView_(data);
         break;
 
       case "updateProfile":
@@ -1571,6 +1575,46 @@ function setReservationView_(d) {
 
   const idCol = headers.indexOf("ReservationID") + 1;
   const viewCol = headers.indexOf("InstructorView") + 1;
+  const last = sheet.getLastRow();
+  let count = 0;
+
+  if (last >= 2) {
+    sheet.getRange(2, idCol, last - 1, 1).getValues().forEach((row, i) => {
+      if (ok[String(row[0])]) {
+        sheet.getRange(i + 2, viewCol).setValue(view);
+        count++;
+      }
+    });
+  }
+
+  clearRowsMemo_();
+  return {message: count + " reservation(s) updated.", count: count};
+}
+
+/* Administrator's Trash / permanent delete of COMPLETED reservations, saved in the
+   sheet so it is the same on every device. view: "" | "Trash" | "Deleted".
+   Rows stay in the sheet and usage reports still count them. */
+function setAdminReservationView_(d) {
+  getSession_(d.token, "Admin");
+  const view = String(d.view || "");
+
+  if (["", "Trash", "Deleted"].indexOf(view) < 0) throw new Error("Invalid view.");
+
+  const ids = [].concat(d.reservationIDs || []).map(String);
+  if (!ids.length) throw new Error("Nothing selected.");
+
+  const sheet = getDB().getSheetByName("Reservations");
+  const headers = ensureColumns_(sheet, ["AdminView"]);
+  const today = Utilities.formatDate(new Date(), CONFIG.TIMEZONE, "yyyy-MM-dd");
+
+  const ok = {};
+  getRows("Reservations").forEach(r => {
+    if (ids.indexOf(String(r.ReservationID)) < 0) return;
+    if (r.Status === "Confirmed" && r.Date <= today) ok[String(r.ReservationID)] = true;
+  });
+
+  const idCol = headers.indexOf("ReservationID") + 1;
+  const viewCol = headers.indexOf("AdminView") + 1;
   const last = sheet.getLastRow();
   let count = 0;
 
